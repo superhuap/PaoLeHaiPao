@@ -195,10 +195,51 @@ def run_account(account: L.Account, cfg: Config, dry_run: bool = False,
     连锁作废 —— 新拿到的那对还没落盘就被下一次续期顶掉了，最终什么都没剩下。
     """
     identity = account.identity()
-    L.bind_account(account.name)
+    # ContextVar 按线程隔离，但用完仍须还原：否则该线程后续的日志会一直挂着
+    # 这个账号。多账号并行时尤其容易串。
+    scope = L.bind_account(account.name)
+    seen: dict[str, L.Rules] = {}
+    try:
+        status, detail = _run_account_body(account, cfg, dry_run, _renewed,
+                                           identity, seen)
+    finally:
+        L.reset_account(scope)
+    # 递归续期时内层已经报过一次，别重复刷屏
+    if not _renewed:
+        _report_progress(account, cfg, seen.get("rules"), dry_run)
+    return status, detail
 
+
+def _report_progress(account: L.Account, cfg: Config,
+                     before: L.Rules | None, dry_run: bool) -> None:
+    """显示服务端记账的有效次数。
+
+    不在本地 +1 推算 —— 跑完重新拉一次 beforeRunV260，拿服务端自己的数字。
+    推算会在计数规则有出入时长期偏着，且偏了也没人发现。
+
+    这一发只读，不消耗配额。重拉失败时退回开跑前读到的值并标注，不能因为
+    一次纯展示性的请求失败就把整个账号判成失败。
+    """
+    if dry_run or before is None:
+        return
+    latest, stale = before, False
+    try:
+        latest = L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+    except L.ProtocolError:
+        stale = True
+    target = f"/{latest.term_target}" if latest.term_target else ""
+    note(account,
+         f"有效 {latest.valid_runs}{target}（学期）· 今日 {latest.today_runs}"
+         + ("（未能刷新，显示开跑前的数值）" if stale else ""))
+
+
+def _run_account_body(account: L.Account, cfg: Config, dry_run: bool,
+                      _renewed: bool, identity: dict[str, Any],
+                      seen: dict[str, L.Rules]) -> tuple[str, str]:
+    """run_account 的主体。调用方已绑定好账号维度。"""
     try:
         rules = L.fetch_rules(identity, cfg.host, cfg.timeout)
+        seen["rules"] = rules
     except L.AuthError:
         if dry_run:
             return FAIL, "token 已失效（演练不做续期这类有副作用的动作）"
@@ -241,7 +282,6 @@ def run_account(account: L.Account, cfg: Config, dry_run: bool = False,
         return OK, "演练通过，未发任何请求"
 
     def refresh_face() -> None:
-        L.bind_account(account.name)
         new_face = _session(lambda: L.renew_face_id(
             account.identity(), rules, account.face_file or "",
             cfg.host, cfg.timeout), account, cfg, "faceVerify")
@@ -312,6 +352,13 @@ def run_account(account: L.Account, cfg: Config, dry_run: bool = False,
         return FAIL, str(exc)
 
     if record.get("record_status") != 1:
+        # 配额 / 重复是「今天跑不了」，不是故障。归类要在看 record_status
+        # **之前**，否则一律落进下面的无效分支。
+        try:
+            L.classify_rejection(record)
+        except (L.QuotaError, L.DuplicateError) as exc:
+            return SKIP, (f"{exc}"
+                          f"（record_id={record.get('record_id')}）")
         return FAIL, (f"{record.get('record_failed_reason') or '<空>'}"
                       f"（record_id={record.get('record_id')}）")
     return OK, f"record_id={record.get('record_id')}"
@@ -348,7 +395,7 @@ def _refresh_only(accounts: list[L.Account], cfg: Config,
                   with_face: bool) -> int:
     """只刷新凭据，不碰跑步流程。
 
-    完全不调 getOssSts / OSS / stopRunV278，因此不产生任何记录、不消耗配额。
+    全程不调 getOssSts / OSS / stopRunV278，因此不产生任何记录、不消耗配额。
 
     **续期无法先试后用**：调用 Login/RefreshToken 的那一刻旧的一对就作废了。
     所以只能「续期 + 落盘」连着做完，没有中间态 —— 成功即净收益，失败（101）
@@ -357,51 +404,59 @@ def _refresh_only(accounts: list[L.Account], cfg: Config,
     say(f"仅刷新凭据，不提交记录。共 {len(accounts)} 个账号")
     failed = 0
     for account in accounts:
-        L.bind_account(account.name)
-        if not account.refresh_token:
-            say(f"{account.name} 未配置 refresh_token，无法续期", logging.ERROR)
-            failed += 1
-            continue
-        before_token = (account.token or "")[:8]
-        before_refresh = (account.refresh_token or "")[:8]
+        scope = L.bind_account(account.name)
         try:
-            token, refresh = L.renew_token(account.identity(),
-                                           account.refresh_token,
-                                           cfg.host, cfg.timeout)
-            # 紧接着落盘，中间不插任何可能抛异常的调用。旧对已作废，
-            # 这一对若此刻丢掉就等于彻底失联。
-            L.save_fields(account, {"token": token, "refresh_token": refresh})
-        except L.ProtocolError as exc:
-            say(f"{account.name} 续期失败：{exc}", logging.ERROR)
-            failed += 1
-            continue
-        account.token, account.refresh_token = token, refresh
-        say(f"{account.name} 续期成功  {before_token}… → {token[:8]}…  "
-            f"refresh {before_refresh}… → {refresh[:8]}…")
-
-        if with_face:
-            try:
-                rules = L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
-                face = L.renew_face_id(account.identity(), rules,
-                                       account.face_file or "",
-                                       cfg.host, cfg.timeout)
-                L.save_fields(account, {"face_verify_id": face})
-                account.face_verify_id = face
-                say(f"{account.name} 人脸重核成功 → {face}", logging.INFO)
-            except L.ProtocolError as exc:
-                say(f"{account.name} 人脸重核失败：{exc}", logging.ERROR)
+            if _refresh_one(account, cfg, with_face) is not None:
                 failed += 1
-
-        # 校验新 token 真的能用
-        try:
-            L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
-            say(f"{account.name} 新凭据已用 {token[:8]}… 验证通过", logging.INFO)
-        except L.ProtocolError as exc:
-            say(f"{account.name} 新凭据验证失败：{exc}", logging.ERROR)
-            failed += 1
-    L.bind_account(None)
+        finally:
+            L.reset_account(scope)
     say(f"刷新完成，失败 {failed} 个")
     return 1 if failed else 0
+
+
+def _refresh_one(account: L.Account, cfg: Config,
+                 with_face: bool) -> str | None:
+    """刷新单个账号的凭据。成功返回 None，失败返回原因。"""
+    if not account.refresh_token:
+        return "未配置 refresh_token，无法续期"
+
+    before_token = (account.token or "")[:8]
+    before_refresh = (account.refresh_token or "")[:8]
+    try:
+        token, refresh = L.renew_token(account.identity(), account.refresh_token,
+                                       cfg.host, cfg.timeout)
+        # 紧接着落盘，中间不插任何可能抛异常的调用：旧对已作废，
+        # 这一对若此刻丢掉就等于彻底失联。
+        L.save_fields(account, {"token": token, "refresh_token": refresh})
+    except L.ProtocolError as exc:
+        return f"续期失败：{exc}"
+
+    account.token, account.refresh_token = token, refresh
+    say(f"{account.name} 续期成功  {before_token}… → {token[:8]}…  "
+        f"refresh {before_refresh}… → {refresh[:8]}…")
+
+    problem = None
+    if with_face:
+        try:
+            rules = L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+            face = L.renew_face_id(account.identity(), rules,
+                                   account.face_file or "", cfg.host, cfg.timeout)
+            L.save_fields(account, {"face_verify_id": face})
+            account.face_verify_id = face
+            say(f"{account.name} 人脸重核成功 → {face}", logging.INFO)
+        except L.ProtocolError as exc:
+            problem = f"人脸重核失败：{exc}"
+            say(f"{account.name} {problem}", logging.ERROR)
+
+    # 新 token 必须真的能用，否则这次续期等于白做
+    try:
+        L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+        say(f"{account.name} 新凭据已用 {token[:8]}… 验证通过", logging.INFO)
+    except L.ProtocolError as exc:
+        reason = f"新凭据验证失败：{exc}"
+        say(f"{account.name} {reason}", logging.ERROR)
+        problem = reason
+    return problem
 
 
 def check(account: L.Account, cfg: Config) -> str:
@@ -555,7 +610,9 @@ def main() -> int:
         tally[status] = tally.get(status, 0) + 1
         note(account, f"{status}  {detail}",
                  logging.INFO if status == OK else logging.WARNING)
-    say(f"合计  成功 {tally[OK]} · 失败 {tally[FAIL]} · 跳过 {tally[SKIP]}")
+    # 「有效」= record_status==1，即服务端认下的成绩。配额/重复虽也会生成
+    # record_id，但那成绩关联不上，算跳过，不计入有效。
+    say(f"合计  有效 {tally[OK]} · 失败 {tally[FAIL]} · 跳过 {tally[SKIP]}")
 
     say(f"耗时 {time.time() - started:.0f}s", logging.DEBUG)
     return 1 if tally[FAIL] else 0

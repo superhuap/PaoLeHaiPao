@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -58,20 +59,33 @@ DEFAULT_HOST = "https://api2.lptiyu.com"
 DEFAULT_OSS_ENDPOINT = "https://lptiyu-data.oss-cn-hangzhou.aliyuncs.com"
 
 log = logging.getLogger("runner")
-_current_account: dict[str, str] = {}
+
+# 账号维度必须按线程隔离 —— 多个账号并行时共用一个全局变量会让所有协议层
+# 日志都标成最后一个绑定的账号。ContextVar 天然按上下文（这里是线程）隔离。
+_current_account: ContextVar[str | None] = ContextVar("lptiyu_account", default=None)
 
 
 def _EXTRA() -> dict[str, str]:
-    """当前账号维度。多账号并行时靠调用方切���。"""
-    return {"account": _current_account.get("name", "调度")}
+    """当前账号维度。"""
+    return {"account": _current_account.get() or "调度"}
 
 
-def bind_account(name: str | None) -> None:
-    """声明当前代码属于哪个账号，使协议层日志在控制台上带账号维度。"""
-    if name is None:
-        _current_account.pop("name", None)
-    else:
-        _current_account["name"] = name
+def bind_account(name: str | None) -> object:
+    """声明当前代码属于哪个账号，使协议层日志带上账号维度。
+
+    返回可交给 ContextVar.reset() 的令牌；调用方应在 finally 里 reset，
+    否则该线程后续的日志会一直挂着这个账号。
+    """
+    return _current_account.set(name)
+
+
+def reset_account(scope: object) -> None:
+    """还原 bind_account 的绑定。传回它返回的令牌。"""
+    try:
+        _current_account.reset(scope)          # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        # 令牌来自别的上下文（例如重入时），直接清空即可
+        _current_account.set(None)
 
 
 def _peek(blob: str) -> Any:
@@ -233,6 +247,23 @@ def _stamp() -> tuple[int, str]:
     return int(time.time()), str(random.randint(100000, 999999))
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    """容错取整。
+
+    这几个计数字段的序列化类型并不统一 —— 实测 total_num 是 JSON 数字 8，
+    而 run_num / term_num 是字符串 '2' / '50'。服务端哪天改一下表示方式，
+    int() 就会直接抛 ValueError 把整个体检带崩，所以一律兜底。
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------- 规则
 
 @dataclass(frozen=True)
@@ -261,6 +292,11 @@ class Rules:
     window_start: int
     window_end: int
     point_max_gap: float
+    # 服务端计数器。total_num 是「已经跑成的次数」而非次数上限，配额上限是
+    # 每天 2 次（run_num 到 2 即当天跑不了了），term_num 才是学期目标。
+    valid_runs: int
+    today_runs: int
+    term_target: int
 
     def distance_for(self, wanted: float) -> float:
         return max(self.min_distance, min(wanted, self.max_distance))
@@ -300,6 +336,9 @@ def parse_rules(payload: dict[str, Any]) -> Rules:
         window_start=int(rule["start_time"]),
         window_end=int(rule["end_time"]),
         point_max_gap=float(line.get("point_max_distance2", 2.0)),
+        valid_runs=_as_int(payload.get("total_num")),
+        today_runs=_as_int(payload.get("run_num")),
+        term_target=_as_int(payload.get("term_num")),
     )
 
 
@@ -606,6 +645,23 @@ def build_run_check_res(identity: dict[str, Any], distance: float,
     return [{"plan": plan, "uid": identity["uid"], "inteval_value": values[plan],
              "inteval_result": zeros, "is_cheat": 0, "is_stop": 0}
             for plan in (1, 4, 5, 6)]
+
+
+def classify_rejection(record: dict[str, Any]) -> None:
+    """按 record_failed_reason 对**解密后的业务载荷**归类。
+
+    信封层看不出配额：服务端会以 ``status=1`` 正常返回，把「当天关联成绩次数
+    已达上限」放进 data.record_failed_reason。只在 interpret() 里按 info 匹配的
+    话，配额用满会掉进「record_status != 1」的通用分支被判成**失败**，
+    于是批处理任务以退出码 1 结束 —— 而配额用满是正常预期，不该让 CI 变红。
+
+    只认得两种可归类的情形，其余交回调用方按无效处理。
+    """
+    reason = str(record.get("record_failed_reason") or "")
+    if "关联成绩次数" in reason:
+        raise QuotaError(reason)
+    if "跑步记录已存在" in reason:
+        raise DuplicateError(reason)
 
 
 # ---------------------------------------------------------------- 三步

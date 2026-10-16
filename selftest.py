@@ -18,7 +18,8 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lptiyu as L      # noqa: E402
-import runner           # noqa: E402
+import runner as R       # noqa: E402
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "lptiyu.py")
@@ -122,10 +123,10 @@ class TestTimeline(unittest.TestCase):
         json.dump(raw, handle)
         handle.close()
         self.addCleanup(os.unlink, handle.name)
-        return runner.load_config(handle.name)
+        return R.load_config(handle.name)
 
     def test_shipped_config_is_valid(self):
-        runner.load_config().validate()
+        R.load_config().validate()
 
     def test_end_pad_must_be_below_submit_tail(self):
         with self.assertRaises(L.ProtocolError) as ctx:
@@ -143,20 +144,20 @@ class TestTimeline(unittest.TestCase):
 
     def test_reports_start_near_window_head(self):
         """上报必须从窗口开头铺开。整体回拨窗口会把上报挤到末端，必被拒。"""
-        cfg = runner.load_config()
-        tl = runner.plan(cfg, at=1_000_000)
+        cfg = R.load_config()
+        tl = R.plan(cfg, at=1_000_000)
         offset = (tl.t0 - tl.start_time) / (tl.end_time - tl.start_time)
         self.assertLess(offset, 0.25,
                         f"首次上报落在窗口 {offset:.0%} 处，应贴近开头")
 
     def test_end_precedes_submit(self):
-        cfg = runner.load_config()
-        tl = runner.plan(cfg, at=1_000_000)
+        cfg = R.load_config()
+        tl = R.plan(cfg, at=1_000_000)
         self.assertLess(tl.end_time, tl.submit_at)
 
     def test_reports_inside_window(self):
-        cfg = runner.load_config()
-        tl = runner.plan(cfg, at=1_000_000)
+        cfg = R.load_config()
+        tl = R.plan(cfg, at=1_000_000)
         self.assertGreaterEqual(tl.t0, tl.start_time)
         self.assertLessEqual(tl.reports_end, tl.end_time)
 
@@ -313,9 +314,175 @@ class TestAtomicCredentialWrite(unittest.TestCase):
         self.assertEqual(saved["refresh_token"], "R1", "空值不应覆盖已有凭据")
 
 
+class TestQuotaClassification(unittest.TestCase):
+    """配额用满是「今天跑不了」，不是故障。
+
+    服务端以 status=1 正常返回，把原因放进 data.record_failed_reason —— 只看
+    信封层的 info 一无所获，配额会掉进「record_status != 1」的通用分支被判成
+    失败，批处理因此以退出码 1 结束，CI 变红。
+    """
+
+    def test_quota_reason_in_payload_raises_quota(self):
+        with self.assertRaises(L.QuotaError):
+            L.classify_rejection({"record_status": 0,
+                                  "record_failed_reason": "当天关联成绩次数已达到上限"})
+
+    def test_duplicate_reason_in_payload_raises_duplicate(self):
+        with self.assertRaises(L.DuplicateError):
+            L.classify_rejection({"record_status": 0,
+                                  "record_failed_reason": "跑步记录已存在，请勿重复提交"})
+
+    def test_valid_record_passes(self):
+        L.classify_rejection({"record_status": 1, "record_id": 1})
+
+    def test_unknown_reason_is_left_to_caller(self):
+        """认不出的原因不能吞掉 —— 得让调用方按无效处理。"""
+        L.classify_rejection({"record_status": 0,
+                              "record_failed_reason": "跑步时间异常"})
+        L.classify_rejection({"record_status": 0})
+
+
+def _before_payload(**extra):
+    """造一份够 parse_rules 用的 beforeRunV260 载荷。"""
+    payload = {
+        "school_id": 918, "term_id": "77", "game_id": "88",
+        "time_rule_arr": [{"time_type": "3", "min_distance": 1.0,
+                           "max_distance": 5.0, "min_pace": 540,
+                           "max_pace": 180, "min_log_num": 4,
+                           "start_time": 18000, "end_time": 82800}],
+        "run_line_info": {"point_max_distance2": 2.0,
+                          "point_list": [{"id": 1, "jingwei": "37.1,122.1"}]},
+    }
+    payload.update(extra)
+    return payload
+
+
+class TestServerCounters(unittest.TestCase):
+    """服务端记账：total_num 有效次数 / run_num 今日 / term_num 学期目标。
+
+    这三个数在实测中序列化类型并不一致（total_num 是数字 8，run_num 是
+    字符串 '2'），所以容错转换必须两头都吃；取不到时也不能炸 ——
+    载荷有 100+ 字段，缺一个计数不该让整个流程失败。
+    """
+
+    def test_extracts_counters(self):
+        rules = L.parse_rules(_before_payload(total_num=8, run_num="2",
+                                              term_num="50"))
+        self.assertEqual(rules.valid_runs, 8)
+        self.assertEqual(rules.today_runs, 2)
+        self.assertEqual(rules.term_target, 50)
+
+    def test_accepts_both_number_and_string(self):
+        rules = L.parse_rules(_before_payload(total_num="9", run_num=3,
+                                              term_num=50))
+        self.assertEqual((rules.valid_runs, rules.today_runs, rules.term_target),
+                         (9, 3, 50))
+
+    def test_missing_counters_default_to_zero(self):
+        rules = L.parse_rules(_before_payload())
+        self.assertEqual((rules.valid_runs, rules.today_runs, rules.term_target),
+                         (0, 0, 0))
+
+    def test_garbage_counters_do_not_raise(self):
+        for junk in ("", "  ", "-", None, "abc", [], {}):
+            with self.subTest(junk=junk):
+                rules = L.parse_rules(_before_payload(total_num=junk))
+                self.assertEqual(rules.valid_runs, 0)
+
+    def test_as_int_rejects_bool(self):
+        """True 不该被当成 1 —— 布尔在这里只可能是标记位。"""
+        self.assertEqual(L._as_int(True), 0)
+
+
+class TestProgressReporting(unittest.TestCase):
+    """进度展示不能反过来把账号判成失败。"""
+
+    def _cfg(self):
+        # 只用到 host / timeout，不值得为测试拼一整个 Config
+        return SimpleNamespace(host="h", timeout=1)
+
+    def test_dry_run_makes_no_request(self):
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise AssertionError("演练不该发请求")
+
+        before = L.parse_rules(_before_payload(total_num=8, term_num=50))
+        with unittest.mock.patch.object(L, "fetch_rules", boom):
+            R._report_progress(SimpleNamespace(name="a", identity=dict),
+                               self._cfg(), before, dry_run=True)
+        self.assertEqual(calls, [])
+
+    def test_refetch_failure_falls_back_without_raising(self):
+        before = L.parse_rules(_before_payload(total_num=8, run_num="2",
+                                               term_num="50"))
+        with unittest.mock.patch.object(L, "fetch_rules",
+                                       side_effect=L.ProtocolError("网络抽风")):
+            with self.assertLogs("runner", level="INFO") as cap:
+                R._report_progress(SimpleNamespace(name="a", identity=dict),
+                                   self._cfg(), before, dry_run=False)
+        text = " ".join(cap.output)
+        self.assertIn("有效 8/50", text)
+        self.assertIn("未能刷新", text, "该标明是兜底值，不能让人误读成最新数")
+
+    def test_prefers_freshly_fetched_value(self):
+        before = L.parse_rules(_before_payload(total_num=8, term_num=50))
+        after = L.parse_rules(_before_payload(total_num=9, run_num="3",
+                                              term_num=50))
+        with unittest.mock.patch.object(L, "fetch_rules", return_value=after):
+            with self.assertLogs("runner", level="INFO") as cap:
+                R._report_progress(SimpleNamespace(name="a", identity=dict),
+                                   self._cfg(), before, dry_run=False)
+        text = "\n".join(cap.output)
+        self.assertIn("有效 9/50", text)
+        self.assertIn("今日 3", text)
+        self.assertNotIn("未能刷新", text)
+
+
+class TestLogAttribution(unittest.TestCase):
+    """多账号并行时协议层日志必须各归各位。
+
+    账号维度原先是模块级 dict，三个线程共享，谁最后绑定谁的号就盖掉全部 ——
+    控制台上三个账号的报文全标成同一个号，排查时会指错方向。
+    """
+
+    def test_bind_is_per_thread(self):
+        import threading as th
+        seen = {}
+        barrier = th.Barrier(2)
+
+        def worker(name):
+            scope = L.bind_account(name)
+            barrier.wait()                    # 强制两个线程同时处于绑定态
+            seen[name] = L._EXTRA()["account"]
+            L.reset_account(scope)
+
+        threads = [th.Thread(target=worker, args=(n,))
+                   for n in ("alpha", "beta")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(seen, {"alpha": "alpha", "beta": "beta"})
+
+    def test_reset_restores_previous_binding(self):
+        outer = L.bind_account("outer")
+        self.addCleanup(lambda: L.reset_account(outer))
+        inner = L.bind_account("inner")
+        self.assertEqual(L._EXTRA()["account"], "inner")
+        L.reset_account(inner)
+        self.assertEqual(L._EXTRA()["account"], "outer")
+
+    def test_unbound_defaults_to_scheduler(self):
+        scope = L.bind_account(None)
+        self.addCleanup(lambda: L.reset_account(scope))
+        self.assertEqual(L._EXTRA()["account"], "调度")
+
+
 class TestConfigValidation(unittest.TestCase):
     def test_end_pad_ge_tail_blocked(self):
-        cfg = runner.Config(
+        cfg = R.Config(
             host="h", oss_endpoint="o", timeout=20, distance=1.62, used_time=375,
             end_margin=45, segment_ratio=0.83, report_count=6, report_interval=60,
             end_pad=120, submit_tail=120, renew_face_before_submit=True,

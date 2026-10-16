@@ -135,6 +135,29 @@ User-Agent 沿用真机值。
 | `run_line_info.point_max_distance2` | 相邻 GPS 点最大间距（围栏） |
 | `run_check[]` | 跑步期检查计划，见 §5.2 |
 | `run_face_verify_config` | `middle_status` `middle_distance` `middle_num`，见 §3.5 |
+| `total_num` | **已经跑成的次数**（本学期累计），即成绩计入后的有效数 |
+| `run_num` | **今日**已跑次数，每日配额上限 2 —— 到 2 即当天跑不了了 |
+| `term_num` | 学期目标次数，本校为 50 |
+
+> ⚠️ **`total_num` 是次数不是上限**，与 `term_num`（学期目标）别混。
+> 配额约束在 `run_num` 上，一天 2 次；跑满后再提交会返回
+> 「当天关联成绩次数已达到上限」，**但服务端仍会生成 record_id** ——
+> 那个成绩关联不上，不算有效。
+
+三个计数器的实测值（三账号同日抓取）：
+
+| 账号 | `total_num` | `run_num` | `term_num` | `total_distance` | 校验 |
+|---|---|---|---|---|---|
+| cyh | 8 | 2 | 50 | 13.62 km | 8 × 1.70 km |
+| lzy | 7 | 2 | 50 | 11.46 km | 7 × 1.64 km |
+| pjh | 6 | 2 | 50 | 9.99 km | 6 × 1.67 km |
+
+次数乘单程距离与累计里程吻合，可确认 `total_num` 计的是已完成次数。
+三者都在**载荷顶层**，不在 `time_rule_arr` 里。
+
+> ⚠️ **序列化类型不统一**：`total_num` 是 JSON 数字 `8`，而 `run_num` /
+> `term_num` 是字符串 `'2'` / `'50'`。直接 `int()` 会在服务端改表示方式时崩掉，
+> 故 `parse_rules` 走容错转换 `_as_int()`，字段缺失一律回落 0。
 
 **配速字段命名反直觉**：`min_pace=540` 是慢的一端，`max_pace=180` 是快的一端。
 解析时排序取 `[180, 540]`。
