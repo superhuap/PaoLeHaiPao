@@ -1,0 +1,30 @@
+{
+  "host": "https://api2.lptiyu.com",
+  "oss_endpoint": "https://lptiyu-data.oss-cn-hangzhou.aliyuncs.com",
+  "timeout": 20,
+
+  "distance": 1.62,
+  "used_time": 375,
+  "end_margin": 45,
+  "segment_ratio": 0.83,
+
+  "report_count": 6,
+  "report_interval": 60,
+  "end_pad": 100,
+  "submit_tail": 120,
+
+  "renew_face_before_submit": true,
+  "start_stagger_seconds": 1,
+
+  "_comment": [
+    "distance / used_time / segment_ratio / report_* 等跑步参数集中在本文件，",
+    "账号信息只在 accounts/*.json 里，两者互不混杂。",
+    "",
+    "时序参数的来历（全部经实测，改动前先读 README 的『为什么必须等』）：",
+    "  used_time 375 + end_margin 45 = 420 秒窗口",
+    "  report_count 6 × report_interval 60 = 300 秒上报跨度，铺满窗口前 3/4",
+    "  end_pad 100 = end_time 比末次上报晚多少，必须 < submit_tail",
+    "  submit_tail 120 = 末次上报后再等多久才提交",
+    "  实测：report_interval 改成 0（连发）或 30（覆盖 36%）均判『跑步时间异常』"
+  ]
+}
