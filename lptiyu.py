@@ -455,21 +455,28 @@ def renew_face_id(identity: dict[str, Any], rules: Rules, face_file: str,
     return face_id
 
 
-def save_field(account: Account, field_name: str, value: str) -> None:
-    """把续期出来的新值写回账号 JSON。
+def save_fields(account: Account, fields: dict[str, str]) -> bool:
+    """把若干新值**一次性**写回账号 JSON。
 
-    token 和 face_verify_id 都会被服务端作废，都属于需要持久化的状态。
+    必须成组写的典型是 token 与 refresh_token：续期让旧的一对同时作废，
+    分两次写会在中间留下「新 token + 已作废的 refresh」—— 那份文件看起来
+    正常，却再也无法自愈，下次报出来的是「凭据对已耗尽」，极难归因。
+    （实测踩过：昨天 cyh / lzy 反复报耗尽，真因就是这里撕了半对。）
+
     写入用临时文件 + os.replace 保证原子性；replace 失败时暂存文件里存着
     可用副本，**必须保留**并报错告知位置 —— 它是唯一的恢复路径，删掉等于
-    把凭据或人脸 id 永久销毁。
+    把凭据永久销毁。
+
+    值都没变则跳过写入。返回是否真的写了。
     """
-    if not account.source or not value:
-        return
+    updates = {k: v for k, v in fields.items() if v}
+    if not account.source or not updates:
+        return False
     with open(account.source, encoding="utf-8") as handle:
         data = json.load(handle)
-    if data.get(field_name) == value:
-        return
-    data[field_name] = value
+    if all(data.get(k) == v for k, v in updates.items()):
+        return False
+    data.update(updates)
     staged = f"{account.source}.tmp"
     try:
         with open(staged, "w", encoding="utf-8") as handle:
@@ -480,6 +487,12 @@ def save_field(account: Account, field_name: str, value: str) -> None:
     except OSError as exc:
         raise ProtocolError(
             f"{exc}；新值已保留在 {staged}，请手动替换到 {account.source}") from exc
+    return True
+
+
+def save_field(account: Account, field_name: str, value: str) -> None:
+    """单字段写入，见 save_fields。"""
+    save_fields(account, {field_name: value})
 
 
 # ---------------------------------------------------------------- 轨迹

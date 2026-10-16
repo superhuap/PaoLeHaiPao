@@ -181,8 +181,7 @@ def _session(step: Callable[[], Any], account: L.Account, cfg: Config,
         identity = account.identity()
         token, refresh = L.renew_token(identity, account.refresh_token,
                                        cfg.host, cfg.timeout)
-        L.save_field(account, "token", token)
-        L.save_field(account, "refresh_token", refresh)
+        L.save_fields(account, {"token": token, "refresh_token": refresh})
         account.token, account.refresh_token = token, refresh
         note(account, "鉴权失效 → 已续期并写回", logging.WARNING)
         return step()
@@ -327,8 +326,7 @@ def _session_probe(account: L.Account, cfg: Config) -> L.Account:
         raise L.AuthError(f"[{account.name}] token 失效且未配置 refresh_token")
     token, refresh = L.renew_token(account.identity(), account.refresh_token,
                                    cfg.host, cfg.timeout)
-    L.save_field(account, "token", token)
-    L.save_field(account, "refresh_token", refresh)
+    L.save_fields(account, {"token": token, "refresh_token": refresh})
     account.token, account.refresh_token = token, refresh
     return account
 
@@ -345,6 +343,66 @@ def _wait_until(target: int) -> None:
 
 
 # ---------------------------------------------------------------- 调度
+
+def _refresh_only(accounts: list[L.Account], cfg: Config,
+                  with_face: bool) -> int:
+    """只刷新凭据，不碰跑步流程。
+
+    完全不调 getOssSts / OSS / stopRunV278，因此不产生任何记录、不消耗配额。
+
+    **续期无法先试后用**：调用 Login/RefreshToken 的那一刻旧的一对就作废了。
+    所以只能「续期 + 落盘」连着做完，没有中间态 —— 成功即净收益，失败（101）
+    则旧对本来也已不可用，不存在额外损失。
+    """
+    say(f"仅刷新凭据，不提交记录。共 {len(accounts)} 个账号")
+    failed = 0
+    for account in accounts:
+        L.bind_account(account.name)
+        if not account.refresh_token:
+            say(f"{account.name} 未配置 refresh_token，无法续期", logging.ERROR)
+            failed += 1
+            continue
+        before_token = (account.token or "")[:8]
+        before_refresh = (account.refresh_token or "")[:8]
+        try:
+            token, refresh = L.renew_token(account.identity(),
+                                           account.refresh_token,
+                                           cfg.host, cfg.timeout)
+            # 紧接着落盘，中间不插任何可能抛异常的调用。旧对已作废，
+            # 这一对若此刻丢掉就等于彻底失联。
+            L.save_fields(account, {"token": token, "refresh_token": refresh})
+        except L.ProtocolError as exc:
+            say(f"{account.name} 续期失败：{exc}", logging.ERROR)
+            failed += 1
+            continue
+        account.token, account.refresh_token = token, refresh
+        say(f"{account.name} 续期成功  {before_token}… → {token[:8]}…  "
+            f"refresh {before_refresh}… → {refresh[:8]}…")
+
+        if with_face:
+            try:
+                rules = L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+                face = L.renew_face_id(account.identity(), rules,
+                                       account.face_file or "",
+                                       cfg.host, cfg.timeout)
+                L.save_fields(account, {"face_verify_id": face})
+                account.face_verify_id = face
+                say(f"{account.name} 人脸重核成功 → {face}", logging.INFO)
+            except L.ProtocolError as exc:
+                say(f"{account.name} 人脸重核失败：{exc}", logging.ERROR)
+                failed += 1
+
+        # 校验新 token 真的能用
+        try:
+            L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+            say(f"{account.name} 新凭据已用 {token[:8]}… 验证通过", logging.INFO)
+        except L.ProtocolError as exc:
+            say(f"{account.name} 新凭据验证失败：{exc}", logging.ERROR)
+            failed += 1
+    L.bind_account(None)
+    say(f"刷新完成，失败 {failed} 个")
+    return 1 if failed else 0
+
 
 def check(account: L.Account, cfg: Config) -> str:
     """只读体检：加载配置、拉一次规则，不产生任何记录。"""
@@ -381,6 +439,10 @@ def main() -> int:
                         help="日志级别；DEBUG 会记录收发报文（已脱敏）")
     parser.add_argument("--quiet", action="store_true",
                         help="控制台只显示警告及以上")
+    parser.add_argument("--refresh", action="store_true",
+                        help="只刷新凭据（token 对、可选人脸 id），不提交任何记录")
+    parser.add_argument("--refresh-face", action="store_true",
+                        help="配合 --refresh：同时重做人脸核验")
     args = parser.parse_args()
 
     logs.configure(args.log_level, quiet=args.quiet)
@@ -415,6 +477,9 @@ def main() -> int:
     say(f"时序 {cfg.window}s 窗口 · 上报 {cfg.report_count}×{cfg.report_interval}s"
         f" · 每人约 {cfg.report_span + cfg.submit_tail}s")
     say(f"账号 {len(accounts)} 个，间隔 {cfg.start_stagger_seconds}s 启动\n")
+
+    if args.refresh:
+        return _refresh_only(accounts, cfg, args.refresh_face)
 
     if args.check:
         bad = 0

@@ -244,6 +244,75 @@ class TestCredentialSafety(unittest.TestCase):
         self.assertFalse(os.path.exists(f"{path}.tmp"))
 
 
+class TestAtomicCredentialWrite(unittest.TestCase):
+    """token 与 refresh_token 必须一次写完。
+
+    续期让旧的一对同时作废。分两次写会在中间留下「新 token + 已作废的
+    refresh」—— 文件看着正常却再也无法自愈，报出来的是「凭据对已耗尽」，
+    极难归因。实测两个账号都因此反复踩过。
+    """
+
+    def setUp(self):
+        self.path = _write_account()
+        self.addCleanup(os.unlink, self.path)
+
+    def test_pair_written_in_one_replace(self):
+        account = L.load_account(self.path)
+        calls = []
+        real = L.os.replace
+
+        def counting(src, dst):
+            calls.append(dst)
+            return real(src, dst)
+
+        with unittest.mock.patch.object(L.os, "replace", counting):
+            L.save_fields(account, {"token": "T2", "refresh_token": "R2"})
+        self.assertEqual(len(calls), 1, f"应只替换一次，实际 {len(calls)} 次")
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual((saved["token"], saved["refresh_token"]), ("T2", "R2"))
+
+    def test_no_torn_state_when_replace_fails(self):
+        """写失败时磁盘必须保持原样，不能留下半对。"""
+        account = L.load_account(self.path)
+        with unittest.mock.patch.object(L.os, "replace",
+                                       side_effect=OSError("Read-only file system")):
+            with self.assertRaises(L.ProtocolError):
+                L.save_fields(account, {"token": "T2", "refresh_token": "R2"})
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual((saved["token"], saved["refresh_token"]),
+                         ("T1", "R1"), "失败后原文件被改动了")
+
+    def test_staged_copy_holds_the_new_pair(self):
+        """暂存文件是唯一的恢复路径，必须留着且内容完整。"""
+        account = L.load_account(self.path)
+        staged = f"{self.path}.tmp"
+        self.addCleanup(lambda: os.path.exists(staged) and os.unlink(staged))
+        with unittest.mock.patch.object(L.os, "replace",
+                                       side_effect=OSError("Read-only file system")):
+            with self.assertRaises(L.ProtocolError):
+                L.save_fields(account, {"token": "T2", "refresh_token": "R2"})
+        self.assertTrue(os.path.exists(staged))
+        with open(staged, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual((saved["token"], saved["refresh_token"]), ("T2", "R2"))
+
+    def test_unchanged_values_skip_write(self):
+        account = L.load_account(self.path)
+        self.assertFalse(L.save_fields(account, {"token": "T1", "refresh_token": "R1"}))
+        self.assertFalse(os.path.exists(f"{self.path}.tmp"))
+
+    def test_blank_values_never_overwrite(self):
+        """值为 None/空 的键必须被跳过，不能把已有值抹成空。"""
+        account = L.load_account(self.path)
+        L.save_fields(account, {"token": "T2", "refresh_token": None})
+        with open(self.path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["token"], "T2", "非空字段应当写入")
+        self.assertEqual(saved["refresh_token"], "R1", "空值不应覆盖已有凭据")
+
+
 class TestConfigValidation(unittest.TestCase):
     def test_end_pad_ge_tail_blocked(self):
         cfg = runner.Config(
