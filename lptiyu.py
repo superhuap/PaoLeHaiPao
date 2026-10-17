@@ -127,6 +127,10 @@ class TransportError(ProtocolError):
     """网络或服务端返回了无法理解的响应。"""
 
 
+class FaceVerifyError(ProtocolError):
+    """人脸核验没通过。消息里必带服务端原话，否则无从判断是照片还是流程。"""
+
+
 class QuotaError(ProtocolError):
     """当日关联成绩次数已达上限。"""
 
@@ -241,6 +245,20 @@ def interpret(reply: dict[str, Any]) -> dict[str, Any]:
 
 def call(path: str, params: dict[str, Any], host: str, timeout: int) -> dict[str, Any]:
     return interpret(_post(path, envelope(params), host, timeout))
+
+
+def call_envelope(path: str, params: dict[str, Any], host: str,
+                  timeout: int) -> dict[str, Any]:
+    """返回**完整信封**，含 info。
+
+    call() 只给 data，把服务端写在 info 里的判定结论丢掉了 —— 而「这步到底
+    过没过」恰恰在 info 里。faceVerify 尤其致命：type=0 失败时照样返回
+    run_face_verify_id，只看 data 会把失败当成通过，一路带到 stopRun 才炸成
+    「人脸验证不合格」（实测为此白等 425s）。
+
+    调用方仍应对 raw 跑 interpret()，以保留 101→AuthError 等既有归类。
+    """
+    return _post(path, envelope(params), host, timeout)
 
 
 def _stamp() -> tuple[int, str]:
@@ -449,8 +467,31 @@ def renew_token(identity: dict[str, Any], refresh_token: str,
     return str(token), str(data.get("refresh_token") or refresh_token)
 
 
+def _face_failed(info: str) -> bool:
+    """判断服务端是否判这一步没通过。**要求「明确说出成功」才算通过。**
+
+    只看 run_face_verify_id 是不够的：type=0 失败时**照样返回 id**。
+
+    实测服务端只有两种文案：
+        通过  人脸验证成功！
+        未过  人脸验证未通过，请重新验证!
+
+    早先这里用的是「失败关键词黑名单」，结果 `未通过` 不在表里 —— 服务端
+    明说没过，代码却打了「type=0 通过」并继续往下跑，一路带到 stopRun 才炸成
+    「人脸验证不合格」，白等 425s（record_id=31992）。
+
+    黑名单天生漏：**没列到的失败文案一律放行**。所以反过来做 ——
+    只有 info 里含「成功」才放行，其余（含空、含未知文案）一律判失败。
+    误判为失败的代价只是多一条警告、多重试一次，且会打出原文便于回填。
+    """
+    if not info.strip():
+        return True                       # 拿不到结论，不能当它通过了
+    return "成功" not in info
+
+
 def renew_face_id(identity: dict[str, Any], rules: Rules, face_file: str,
-                  host: str, timeout: int, confirms: int = 2) -> str:
+                  host: str, timeout: int, confirms: int = 2,
+                  retries: int = 1) -> str:
     """重做整套人脸核验，返回新的 run_face_verify_id。
 
     真机上是拍照 + 活体检测，分三步：type=0 取 id，再 type=2 确认两次
@@ -458,8 +499,11 @@ def renew_face_id(identity: dict[str, Any], rules: Rules, face_file: str,
     **不需要 lp31、不需要跑步层私有盐** —— 只要给一个此前成功核验时上传过的
     face_file 路径。
 
-    只做 type=0 拿到的 id 提交会被判「人脸验证不合格」；type=2 必须带
-    face_file，否则报「参数异常」。
+    **必须校验服务端写在信封 info 里的判定**，只看 run_face_verify_id 非空会把
+    失败当成功：type=0 失败时照样返回 id，随后提交被判「人脸验证不合格」。
+
+    type=0 判失败时带着返回的 id 再试一次 —— 这正是真机的行为（首次拍照可能
+    「未拍到完整人脸」，下次带上 id 就过了）。
 
     school_id 取自 rules 而非 identity —— 它由 beforeRunV260 下发，不在账号里。
     """
@@ -468,9 +512,9 @@ def renew_face_id(identity: dict[str, Any], rules: Rules, face_file: str,
             "需要重新人脸核验，但账号里没有 face_file。请把真机成功核验时上传的"
             "照片路径（Public/Upload/pic/face_verify/…）填进账号 JSON")
 
-    def ask(**extra: Any) -> str:
+    def ask(**extra: Any) -> tuple[dict[str, Any], str]:
         stamp, nonce = _stamp()
-        data = call(FACE_API, {
+        raw = call_envelope(FACE_API, {
             **identity,
             "token": identity["token"],
             "uid": identity["uid"],
@@ -480,18 +524,78 @@ def renew_face_id(identity: dict[str, Any], rules: Rules, face_file: str,
             "ostype": 5, "timestamp": stamp, "nonce": nonce,
             **extra,
         }, host, timeout)
-        return str(data.get("run_face_verify_id") or "")
+        info = str(raw.get("info") or "")
+        try:
+            # 仍走 interpret，保留 101→AuthError 等既有归类
+            return interpret(raw), info
+        except TransportError:
+            # 失败应答可能不带 data，此时原话比异常更有价值
+            return {}, info
 
-    face_id = ask(type=0)
-    if not face_id:
-        raise AuthError("type=0 人脸核验未返回 run_face_verify_id")
-    log.info("人脸核验 type=0 通过，id 前缀 %s", face_id[:4],
-             extra=_EXTRA())
-    for _ in range(max(0, confirms)):
-        ask(type=2, run_face_verify_id=face_id)
-    log.info("人脸核验 type=2 确认 %d 次完成", max(0, confirms),
-             extra=_EXTRA())
+    face_id = ""
+    for attempt in range(retries + 1):
+        extra: dict[str, Any] = {"type": 0}
+        if face_id:
+            extra["run_face_verify_id"] = face_id
+        data, info = ask(**extra)
+        face_id = str(data.get("run_face_verify_id") or "")
+        if not face_id:
+            raise AuthError(f"type=0 人脸核验未返回 run_face_verify_id（{info}）")
+        if not _face_failed(info):
+            log.info("人脸核验 type=0 通过，id 前缀 %s（%s）", face_id[:4], info,
+                     extra=_EXTRA())
+            break
+        if attempt >= retries:
+            raise FaceVerifyError(
+                f"人脸核验 type=0 未通过，重试 {retries} 次仍失败：{info}"
+                f"（face_file={face_file}）")
+        log.warning("人脸核验 type=0 未通过（%s），带上返回的 id 重试", info,
+                    extra=_EXTRA())
+
+    for index in range(max(0, confirms)):
+        _, info = ask(type=2, run_face_verify_id=face_id)
+        if _face_failed(info):
+            raise FaceVerifyError(
+                f"人脸核验 type=2 第 {index + 1}/{max(0, confirms)} 次确认未通过："
+                f"{info}（face_file={face_file}）")
+    log.info("人脸核验 type=2 确认 %d 次完成", max(0, confirms), extra=_EXTRA())
     return face_id
+
+
+def upload_track(sts: dict[str, Any], endpoint: str, key: str,
+                 body: bytes, timeout: int) -> None:
+    """上传跑步轨迹文件。"""
+    upload_object(sts, endpoint, key, body, timeout,
+                  filename="run_record.txt", content_type="text/plain")
+
+
+def face_object_key(when: datetime | None = None) -> str:
+    """生成一个人脸照片的 OSS key，格式对齐真机：
+
+    ``Public/Upload/pic/face_verify/<日期>/<三位数>/<uuid>.jpg``
+    """
+    stamp = when or datetime.now()
+    return (f"Public/Upload/pic/face_verify/{stamp:%Y-%m-%d}/"
+            f"{uuid4().int % 1000:03d}/{uuid4()}.jpg")
+
+
+def republish_face(identity: dict[str, Any], rules: Rules, image: bytes,
+                   sts: dict[str, Any], endpoint: str,
+                   timeout: int) -> str:
+    """把人脸照片重传到 OSS 新路径，返回新 key。
+
+    实测：同一张图片换一个 OSS 路径，服务端的判定会从「人脸验证未通过」
+    变成「人脸验证成功」。所以旧路径失效时**不必重新拍照** —— 重传一份即可，
+    不用真机参与。
+
+    注意服务端确实会做人脸比对（拿别人的照片会被判未通过），所以传错人
+    照样过不了 —— 这正好可以用来验证传的是不是本人的照片。
+    """
+    key = face_object_key()
+    upload_object(sts, endpoint, key, image, timeout,
+                  filename="face.jpg", content_type="image/jpeg")
+    log.info("人脸照片已重传到 %s（%d 字节）", key, len(image), extra=_EXTRA())
+    return key
 
 
 def save_fields(account: Account, fields: dict[str, str]) -> bool:
@@ -716,13 +820,17 @@ def fetch_sts(identity: dict[str, Any], rules: Rules,
     return data
 
 
-def upload_track(sts: dict[str, Any], endpoint: str, key: str,
-                 body: bytes, timeout: int) -> None:
-    """OSS 表单上传。
+def upload_object(sts: dict[str, Any], endpoint: str, key: str, body: bytes,
+                  timeout: int, filename: str = "obj.bin",
+                  content_type: str = "application/octet-stream") -> None:
+    """OSS 表单上传任意对象。
 
     必须 POST 到 bucket 根路径、object key 放在表单字段里；PUT 到对象路径
     会被拒（`AccessDenied ... because of bucket acl`）—— 临时密钥只授了表单
     上传权限。成功返回 **204**，不是 200。
+
+    临时密钥的权限**不限于轨迹目录**：实测可写
+    `Public/Upload/pic/face_verify/…`，所以人脸照片能在本机重传而无需真机。
     """
     policy = base64.b64encode(json.dumps({
         "expiration": (datetime.now(timezone.utc) + timedelta(seconds=3600))
@@ -742,8 +850,10 @@ def upload_track(sts: dict[str, Any], endpoint: str, key: str,
         chunks.append(
             f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     chunks.append(f"--{boundary}\r\n".encode())
-    chunks.append(b'Content-Disposition: form-data; name="file"; '
-                  b'filename="run_record.txt"\r\nContent-Type: text/plain\r\n\r\n')
+    chunks.append(
+        f'Content-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\n'
+        f'Content-Type: {content_type}\r\n\r\n'.encode())
     chunks.append(body)
     chunks.append(b"\r\n")
     chunks.append(f"--{boundary}--\r\n".encode())

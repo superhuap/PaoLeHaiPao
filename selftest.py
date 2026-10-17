@@ -357,6 +357,119 @@ def _before_payload(**extra):
     return payload
 
 
+_IDENTITY = {"uid": "20330647", "student_num": "26540E0115",
+             "term_id": "", "game_id": "", "school_id": "", "token": "T"}
+
+FACE_OK = "人脸验证成功！"
+FACE_BLUR = "未拍到完整人脸"
+# 实测拿到的真实失败文案（record_id=31992 那次 cyh 的判定）
+FACE_FAIL = "人脸验证未通过，请重新验证!"
+
+
+def _face_env(face_id="abc123def456", info=FACE_OK):
+    """faceVerify 的信封：注意失败时**照样**带 run_face_verify_id。"""
+    return {"status": 1, "info": info,
+            "data": {"run_face_verify_id": face_id}}
+
+
+class _FakeFaceAPI:
+    """按脚本回放 faceVerify 应答，并记录每次请求。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def __call__(self, path, params, host, timeout):
+        self.calls.append(dict(params))
+        return self.script.pop(0) if self.script else _face_env()
+
+
+class TestFaceVerification(unittest.TestCase):
+    """必须读服务端写在信封 info 里的判定结论。
+
+    只看 run_face_verify_id 非空是不够的：type=0 失败时**照样返回 id**
+    （PROTOCOL.md §3.5）。此前代码因此把失败当成功，一路带到 stopRun 才
+    炸成「人脸验证不合格」，实测白等 425s。
+    """
+
+    def setUp(self):
+        self.rules = L.parse_rules(_before_payload())
+
+    def _run(self, fake, face_file="Public/Upload/pic/face_verify/x.jpg"):
+        with unittest.mock.patch.object(L, "call_envelope", fake):
+            return L.renew_face_id(_IDENTITY, self.rules, face_file, "h", 5)
+
+    def test_failed_type0_is_retried_with_the_returned_id(self):
+        """失败后带着原 id 再调一次 —— 这正是真机的行为。"""
+        fake = _FakeFaceAPI([_face_env(info=FACE_BLUR),
+                             _face_env(info=FACE_OK),      # 重试 type=0
+                             _face_env(), _face_env()])    # type=2 x2
+        self._run(fake)
+        self.assertEqual(len(fake.calls), 4)
+        first, retry = fake.calls[0], fake.calls[1]
+        self.assertEqual(first["type"], 0)
+        self.assertEqual(retry["type"], 0)
+        self.assertEqual(retry.get("run_face_verify_id"), "abc123def456",
+                         "重试必须带上失败时返回的那个 id")
+
+    def test_retry_exhausted_raises_with_server_wording(self):
+        """重试仍失败要抛异常，且带上服务端原话便于定位。"""
+        fake = _FakeFaceAPI([_face_env(info=FACE_BLUR) for _ in range(4)])
+        with self.assertRaises(L.ProtocolError) as ctx:
+            self._run(fake)
+        self.assertIn(FACE_BLUR, str(ctx.exception))
+
+    def test_success_wording_does_not_retry(self):
+        fake = _FakeFaceAPI([_face_env(), _face_env(), _face_env()])
+        self._run(fake)
+        self.assertEqual(len(fake.calls), 3, "成功文案不该触发重试")
+        self.assertEqual([c["type"] for c in fake.calls], [0, 2, 2])
+
+    def test_type2_response_is_not_discarded(self):
+        """type=2 的应答同样要检查，不能拿到就扔。"""
+        fake = _FakeFaceAPI([_face_env(),
+                             _face_env(info=FACE_BLUR),    # 第一次确认失败
+                             _face_env()])
+        with self.assertRaises(L.ProtocolError) as ctx:
+            self._run(fake)
+        self.assertIn(FACE_BLUR, str(ctx.exception))
+
+    def test_all_steps_report_server_wording(self):
+        """三步各自的判定都要进日志，否则排查仍然靠猜。"""
+        fake = _FakeFaceAPI([_face_env(), _face_env(), _face_env()])
+        with self.assertLogs("runner", level="INFO") as cap:
+            self._run(fake)
+        self.assertIn(FACE_OK, " ".join(cap.output))
+
+    def test_verdict_requires_positive_confirmation(self):
+        """只有明说「成功」才放行。
+
+        这里曾用失败关键词黑名单，结果服务端真实的「未通过」不在表里 ——
+        明说没过却被放行，一路带到 stopRun 炸成「人脸验证不合格」，白等 425s。
+        黑名单天生漏，必须改成「要求成功」。
+        """
+        self.assertFalse(L._face_failed(FACE_OK))
+        self.assertTrue(L._face_failed(FACE_FAIL), "真实失败文案必须判为失败")
+        self.assertTrue(L._face_failed(FACE_BLUR))
+        self.assertTrue(L._face_failed(""))
+        self.assertTrue(L._face_failed("人脸比对未通过"))
+
+    def test_unknown_wording_is_treated_as_failure(self):
+        """没见过的文案不能默认放行 —— 那正是上次漏判的成因。"""
+        for msg in ("请稍后重试", "系统繁忙", "0", "OK"):
+            with self.subTest(msg=msg):
+                self.assertTrue(L._face_failed(msg))
+
+    def test_real_failure_wording_triggers_retry_then_raises(self):
+        """用实测文案跑一遍完整流程：必须重试、最终抛出且带上原文。"""
+        fake = _FakeFaceAPI([_face_env(info=FACE_FAIL) for _ in range(4)])
+        with self.assertRaises(L.ProtocolError) as ctx:
+            self._run(fake)
+        self.assertIn(FACE_FAIL, str(ctx.exception))
+        self.assertEqual(len(fake.calls), 2,
+                         "type=0 重试一次仍失败就该中止，type=2 不必再发")
+
+
 class TestServerCounters(unittest.TestCase):
     """服务端记账：total_num 有效次数 / run_num 今日 / term_num 学期目标。
 
@@ -438,6 +551,33 @@ class TestProgressReporting(unittest.TestCase):
         self.assertIn("有效 9/50", text)
         self.assertIn("今日 3", text)
         self.assertNotIn("未能刷新", text)
+
+
+class TestFaceRepublish(unittest.TestCase):
+    """人脸照片重传：同一张图换新路径就能恢复，不必重新拍照。"""
+
+    def test_key_matches_real_device_layout(self):
+        import datetime
+        key = L.face_object_key(datetime.datetime(2026, 10, 17, 12, 0))
+        head = "Public/Upload/pic/face_verify/2026-10-17/"
+        self.assertTrue(key.startswith(head), key)
+        tail = key[len(head):]
+        folder, _, name = tail.partition("/")
+        self.assertEqual(len(folder), 3, "三位数目录")
+        self.assertTrue(folder.isdigit())
+        self.assertTrue(name.endswith(".jpg"))
+        self.assertEqual(len(name), 36 + 4, "uuid + .jpg")
+
+    def test_keys_are_unique(self):
+        keys = {L.face_object_key() for _ in range(50)}
+        self.assertEqual(len(keys), 50, "每次都应生成不同 key，避免互相覆盖")
+
+    def test_upload_declares_image_content_type(self):
+        """上传器已泛化；人脸照片必须声明 image/jpeg。"""
+        source = open(os.path.join(os.path.dirname(L.__file__), "lptiyu.py"),
+                      encoding="utf-8").read()
+        self.assertIn("content_type=\"image/jpeg\"", source)
+        self.assertIn("filename=\"face.jpg\"", source)
 
 
 class TestLogAttribution(unittest.TestCase):

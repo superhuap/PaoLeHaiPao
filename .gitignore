@@ -1,1 +1,4 @@
+.DS_Store
 accounts/*.tmp
+docker/.DS_Store
+picture/
