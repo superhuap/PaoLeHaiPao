@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import shutil
 import tempfile
 import unittest
 import unittest.mock
@@ -553,7 +554,7 @@ class TestProgressReporting(unittest.TestCase):
         self.assertNotIn("未能刷新", text)
 
 
-class TestFaceRepublish(unittest.TestCase):
+class TestFaceRepublishLayout(unittest.TestCase):
     """人脸照片重传：同一张图换新路径就能恢复，不必重新拍照。"""
 
     def test_key_matches_real_device_layout(self):
@@ -578,6 +579,75 @@ class TestFaceRepublish(unittest.TestCase):
                       encoding="utf-8").read()
         self.assertIn("content_type=\"image/jpeg\"", source)
         self.assertIn("filename=\"face.jpg\"", source)
+
+
+class TestAutoRepublish(unittest.TestCase):
+    """人脸核验失败后自动重传照片再试。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_missing_photo_returns_none(self):
+        """照片是可选增强，没配不能崩 —— 调用方据此退回原行为。"""
+        self.assertIsNone(L.load_face_image(self.dir, "cyh"))
+
+    def test_empty_file_is_not_returned(self):
+        open(os.path.join(self.dir, "cyh.jpg"), "wb").close()
+        self.assertIsNone(L.load_face_image(self.dir, "cyh"),
+                          "空文件不能当照片传上去")
+
+    def test_reads_each_extension(self):
+        for suffix in (".jpg", ".jpeg", ".png"):
+            with self.subTest(suffix=suffix):
+                path = os.path.join(self.dir, f"p{suffix}")
+                open(path, "wb").write(b"x")
+                self.assertEqual(L.load_face_image(self.dir, "p"), b"x")
+
+    def test_picture_dir_resolves_relative_to_project(self):
+        """相对路径必须按工程目录解析，不能依赖进程 cwd。"""
+        self.assertEqual(R._picture_dir("picture"),
+                         os.path.join(R.HERE, "picture"))
+        self.assertEqual(R._picture_dir("/data/picture"), "/data/picture")
+        self.assertEqual(R._picture_dir(None), R.PICTURE_DIR)
+
+    def test_default_is_enabled(self):
+        """默认开着 —— 实测重传一次就能救回来，代价只有一发 OSS 上传。"""
+        self.assertTrue(R.load_config().auto_republish_face)
+
+    def test_republish_never_touches_token(self):
+        """重传只改人脸两项，凭据必须原样。
+
+        重传的落盘要和 token 续期一样走 save_fields —— 后者一旦被改成
+        只写人脸字段，token 对被撕裂的坑就会重新出现。
+        """
+        path = _write_account(face_file="Public/old.jpg", face_verify_id="old-id")
+        self.addCleanup(os.unlink, path)
+        account = L.load_account(path)
+        self.assertTrue(L.save_fields(account, {
+            "face_file": "Public/new.jpg", "face_verify_id": "new-id"}))
+        with open(path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["face_file"], "Public/new.jpg")
+        self.assertEqual(saved["face_verify_id"], "new-id")
+        self.assertEqual(saved["token"], "T1")
+        self.assertEqual(saved["refresh_token"], "R1")
+
+    def test_face_file_and_id_survive_together(self):
+        """两个字段一次写入 —— 中途断掉不能留下半对。"""
+        path = _write_account(face_file="Public/old.jpg", face_verify_id="old-id")
+        self.addCleanup(os.unlink, path)
+        account = L.load_account(path)
+        L.save_fields(account, {"face_file": "Public/new.jpg"})
+        with open(path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["face_file"], "Public/new.jpg")
+        self.assertEqual(saved["face_verify_id"], "old-id",
+                         "未提供的字段不得被清空")
+
+    def test_face_verify_error_is_protocol_error_subclass(self):
+        """refresh_face 的 except 分支要能兜住。"""
+        self.assertTrue(issubclass(L.FaceVerifyError, L.ProtocolError))
 
 
 class TestLogAttribution(unittest.TestCase):

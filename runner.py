@@ -29,6 +29,8 @@ import logs
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 ACCOUNTS_DIR = os.path.join(HERE, "accounts")
+# 人脸照片目录。容器里随 accounts 一起挂进来（/data/picture），不含在镜像里。
+PICTURE_DIR = os.path.join(HERE, "picture")
 
 OK, FAIL, SKIP = "成功", "失败", "跳过"
 
@@ -71,6 +73,11 @@ class Config:
     submit_tail: int
     renew_face_before_submit: bool
     start_stagger_seconds: int
+    # 人脸核验失败时自动把本地照片重传一份再试（见 refresh_face）。
+    # 给默认值而不是必填：Config 会被测试和外部脚本直接构造，
+    # 加必填字段会让所有既有调用点一起炸。
+    auto_republish_face: bool = True
+    face_picture_dir: str = PICTURE_DIR
 
     @property
     def window(self) -> int:
@@ -101,6 +108,11 @@ class Config:
                 f"{self.window}s，end_time 会被推到未来")
 
 
+def _picture_dir(raw: Any) -> str:
+    value = str(raw or PICTURE_DIR)
+    return value if os.path.isabs(value) else os.path.join(HERE, value)
+
+
 def load_config(path: str = CONFIG_PATH) -> Config:
     with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -118,6 +130,11 @@ def load_config(path: str = CONFIG_PATH) -> Config:
         submit_tail=int(raw["submit_tail"]),
         renew_face_before_submit=bool(raw.get("renew_face_before_submit", True)),
         start_stagger_seconds=int(raw.get("start_stagger_seconds", 10)),
+        # 默认开：实测重传一次就能把人脸核验救回来，代价只有一发 OSS 上传
+        auto_republish_face=bool(raw.get("auto_republish_face", True)),
+        # 相对路径按工程目录解析，与 ACCOUNTS_DIR 一致；
+        # 容器里 /app/picture 是指向 /data/picture 的软链
+        face_picture_dir=_picture_dir(raw.get("face_picture_dir")),
     )
     cfg.validate()
     return cfg
@@ -281,10 +298,44 @@ def _run_account_body(account: L.Account, cfg: Config, dry_run: bool,
     if dry_run:
         return OK, "演练通过，未发任何请求"
 
-    def refresh_face() -> None:
-        new_face = _session(lambda: L.renew_face_id(
+    def do_face() -> str:
+        return _session(lambda: L.renew_face_id(
             account.identity(), rules, account.face_file or "",
             cfg.host, cfg.timeout), account, cfg, "faceVerify")
+
+    def refresh_face(republish: bool = False) -> None:
+        """重核人脸。republish=True 时允许失败后重传照片再试一次。
+
+        实测：同一张图换个 OSS 路径，服务端判定就从「人脸验证未通过」变成
+        「人脸验证成功」—— 旧路径失效不必重新拍照，重传即可。所以这里把
+        「照片没人维护」这个坑兜住。
+
+        重传后新 key 必须**立刻**落盘，否则这条路径下次又用旧的。
+        """
+        try:
+            new_face = do_face()
+        except L.FaceVerifyError as exc:
+            if not republish or not cfg.auto_republish_face:
+                raise
+            image = L.load_face_image(cfg.face_picture_dir, account.name)
+            if image is None:
+                note(account,
+                     f"人脸核验未通过，且 {cfg.face_picture_dir} 下没有"
+                     f"{account.name}.jpg 可重传（{exc}）")
+                raise
+            note(account, f"人脸核验未通过，重传照片后重试（{exc}）")
+            sts = L.fetch_sts(account.identity(), rules, cfg.host, cfg.timeout)
+            endpoint = cfg.oss_endpoint or sts.get("endpoint") or L.DEFAULT_OSS_ENDPOINT
+            # face_file 和 face_verify_id 存在依赖：先传拿到新 key，
+            # 再一次写入落盘，避免中途断掉留下半对。
+            new_file = L.republish_face(account.identity(), rules, image, sts,
+                                        endpoint, cfg.timeout)
+            account.face_file = new_file
+            new_face = do_face()
+            L.save_fields(account, {"face_file": new_file,
+                                    "face_verify_id": new_face})
+            note(account, f"人脸重传后通过 {new_file.split('/')[-3]}/… {new_face}")
+            return
         L.save_field(account, "face_verify_id", new_face)
         account.face_verify_id = new_face
         note(account, f"人脸重核完成 {new_face}")
@@ -295,7 +346,8 @@ def _run_account_body(account: L.Account, cfg: Config, dry_run: bool,
     # 不会让 id 在提交时过期；提交前那次只是确保新鲜。
     if cfg.renew_face_before_submit:
         try:
-            refresh_face()
+            # 只在 t=0 允许重传：提交前那次已经没时间救回来了
+            refresh_face(republish=True)
         except L.ProtocolError as exc:
             return FAIL, f"人脸重核失败：{exc}"
 
@@ -390,6 +442,51 @@ def _wait_until(target: int) -> None:
 
 
 # ---------------------------------------------------------------- 调度
+
+def _republish_only(accounts: list[L.Account], cfg: Config) -> int:
+    """只重传人脸照片并重核，不提交任何记录。
+
+    给运维用的一条直接手段：人脸核验挂了不必去改账号 JSON，跑这个就行。
+    不消耗跑步配额 —— 不调 stopRunV278，也不进跑步窗口。
+    """
+    say(f"仅重传人脸照片并重核。共 {len(accounts)} 个账号")
+    failed = 0
+    for account in accounts:
+        scope = L.bind_account(account.name)
+        try:
+            try:
+                _republish_one(account, cfg)
+            except L.ProtocolError as exc:
+                say(f"{account.name} 重传失败：{exc}", logging.ERROR)
+                failed += 1
+        finally:
+            L.reset_account(scope)
+    say(f"重传完成，失败 {failed} 个")
+    return 1 if failed else 0
+
+
+def _republish_one(account: L.Account, cfg: Config) -> None:
+    image = L.load_face_image(cfg.face_picture_dir, account.name)
+    if image is None:
+        raise L.FaceVerifyError(
+            f"{cfg.face_picture_dir} 下没有 {account.name}.jpg/.jpeg/.png")
+
+    rules = L.fetch_rules(account.identity(), cfg.host, cfg.timeout)
+    sts = L.fetch_sts(account.identity(), rules, cfg.host, cfg.timeout)
+    endpoint = cfg.oss_endpoint or sts.get("endpoint") or L.DEFAULT_OSS_ENDPOINT
+    old = account.face_file or ""
+    new_file = L.republish_face(account.identity(), rules, image, sts,
+                                endpoint, cfg.timeout)
+
+    face_id = _session(lambda: L.renew_face_id(
+        account.identity(), rules, new_file, cfg.host, cfg.timeout),
+        account, cfg, "faceVerify")
+    # 核验通过才落盘：先换掉 face_file 再发现核不过，等于把能用的旧路径也毁了
+    L.save_fields(account, {"face_file": new_file, "face_verify_id": face_id})
+    account.face_file, account.face_verify_id = new_file, face_id
+    say(f"{account.name} 重传并核验通过 {new_file}  face_id={face_id}"
+        + (f"（原 {old}）" if old else ""))
+
 
 def _refresh_only(accounts: list[L.Account], cfg: Config,
                   with_face: bool) -> int:
@@ -498,6 +595,9 @@ def main() -> int:
                         help="只刷新凭据（token 对、可选人脸 id），不提交任何记录")
     parser.add_argument("--refresh-face", action="store_true",
                         help="配合 --refresh：同时重做人脸核验")
+    parser.add_argument("--republish-face", dest="republish_face_only",
+                        action="store_true",
+                        help="只重传人脸照片并重核，不提交任何记录")
     args = parser.parse_args()
 
     logs.configure(args.log_level, quiet=args.quiet)
@@ -532,6 +632,9 @@ def main() -> int:
     say(f"时序 {cfg.window}s 窗口 · 上报 {cfg.report_count}×{cfg.report_interval}s"
         f" · 每人约 {cfg.report_span + cfg.submit_tail}s")
     say(f"账号 {len(accounts)} 个，间隔 {cfg.start_stagger_seconds}s 启动\n")
+
+    if args.republish_face_only:
+        return _republish_only(accounts, cfg)
 
     if args.refresh:
         return _refresh_only(accounts, cfg, args.refresh_face)

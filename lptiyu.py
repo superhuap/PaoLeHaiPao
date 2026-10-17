@@ -579,6 +579,26 @@ def face_object_key(when: datetime | None = None) -> str:
             f"{uuid4().int % 1000:03d}/{uuid4()}.jpg")
 
 
+def load_face_image(directory: str, name: str) -> bytes | None:
+    """读 <directory>/<name>.jpg，没有就返回 None。
+
+    安静返回 None 是刻意的：照片是可选增强，没配就不能让账号跑不起来。
+    调用方据此跳过重传，退回原有行为。
+
+    只认 .jpg/.jpeg/.png，真机上传的就是这几种。
+    """
+    for suffix in (".jpg", ".jpeg", ".png"):
+        path = os.path.join(directory, f"{name}{suffix}")
+        try:
+            with open(path, "rb") as handle:
+                image = handle.read()
+        except OSError:
+            continue
+        if image:
+            return image
+    return None
+
+
 def republish_face(identity: dict[str, Any], rules: Rules, image: bytes,
                    sts: dict[str, Any], endpoint: str,
                    timeout: int) -> str:

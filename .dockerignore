@@ -8,5 +8,11 @@ run.log
 __pycache__/
 *.pyc
 # 真实账号文件含 token/refresh_token，绝不能进镜像层。
-# 新建容器时由 entrypoint 从 docker/seed/accounts/*.example.json 生成空模板。
+# 新建容器时由 entrypoint 从 docker/seed/accounts/
+# 人脸照片：生物特征数据，既不进 git 也不进镜像层。
+# compose 用 bind-mount 提供，缺失时自动重传会安静跳过。
+picture/*.example.json 生成空模板。
 accounts/
+# 人脸照片：生物特征数据，既不进 git 也不进镜像层。
+# compose 用 bind-mount 提供，缺失时自动重传会安静跳过。
+picture/

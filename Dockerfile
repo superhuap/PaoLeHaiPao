@@ -48,14 +48,15 @@ COPY docker/seed/accounts/ /app/seed-accounts/
 # 种子配置必须在这里落成真文件：/app/config.json 是指向它的软链，而
 # selftest.py 的 TestTimeline 直接读它 —— 构建期文件缺失会让自检以
 # FileNotFoundError 挂掉，测的并不是代码而是没喂进去的数据。
-RUN mkdir -p /data/accounts /data/logs /data/state \
+RUN mkdir -p /data/accounts /data/logs /data/state /data/picture \
  && chmod +x /app/entrypoint.sh /app/scheduler.py \
  && cp /app/seed-config.json /data/config.json \
  && python -c 'import json;json.load(open("/data/config.json"));print("种子配置就位且可解析")'
 
 # 数据面软链：代码只认 /app 下的相对路径，数据实际存 /data
 RUN ln -s /data/config.json /app/config.json \
- && ln -s /data/accounts /app/accounts
+ && ln -s /data/accounts /app/accounts \
+ && ln -s /data/picture /app/picture
 
 # 构建期自检：selftest 不打网络，坏了就别出镜像（秒级）
 RUN python selftest.py

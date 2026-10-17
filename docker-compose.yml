@@ -32,6 +32,9 @@ services:
     volumes:
       - ./config.json:/data/config.json
       - ./accounts:/data/accounts
+      # 人脸照片，供人脸核验失败时自动重传。不进镜像层、不进 git。
+      # 缺了也不影响运行 —— 会退回到只报「没有照片可重传」。
+      - ./picture:/data/picture:ro
       - lptiyu-logs:/data/logs
     stop_grace_period: 30s
 
