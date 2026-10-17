@@ -10,6 +10,12 @@ runner/
 ├── logs.py            日志（仅控制台）
 ├── selftest.py        自检（不打网络，秒级）
 ├── runner.py          调度器
+├── Dockerfile         镜像（常驻定时器）
+├── docker-compose.yml 一条命令起
+├── docker/
+│   ├── entrypoint.sh  准备数据目录 + 分发一次性命令
+│   ├── scheduler.py   每天 07:30 / 13:30（UTC+8）触发
+│   └── seed/          首次启动的默认配置与账号模板
 ├── accounts/
 │   ├── cyh.json       每个文件 = 一个账号
 │   ├── lzy.json
@@ -72,6 +78,80 @@ python3 runner.py --quiet               # 只显示警告以上
 ```
 
 终端回滚缓冲、tmux、录屏都可能把明文带出去，脱敏因此仍然必要。
+
+## Docker
+
+一条命令起常驻容器，之后**每天 07:30、13:30（UTC+8）**各跑一轮：
+
+```bash
+docker compose up -d          # 起（首次会自动构建镜像）
+docker compose logs -f        # 实时输出
+docker compose down           # 停，账号数据不丢
+```
+
+### 数据持久化与 token 写回
+
+容器里代码在 `/app`，**所有数据在 `/data`**：`config.json`、`accounts/*.json`、
+`logs/`。`/app/config.json` 和 `/app/accounts` 是指向 `/data` 的软链，所以
+`runner.py` 续期后调 `save_fields()` 原子写回（临时文件 + `os.replace`）时，
+写的就是挂载出来的宿主文件 —— 见下面「自动写回」一节，`docker compose down`
+再起，token 是新的。
+
+`docker-compose.yml` 默认把仓库里的 `config.json` 和 `accounts/` 直接挂进去，
+改完仓库里的 JSON 即刻生效。要把数据完全移出仓库，改用具名卷：
+
+```bash
+docker run -d --name lptiyu --restart unless-stopped \
+  -v lptiyu-data:/data lptiyu-runner:latest
+```
+
+全新数据卷首次启动会生成 `config.json` 和 `accounts/example.json.disabled`
+（模板，`.disabled` 后缀不会被 `runner.py` 扫到）：填好凭据、去掉 `.disabled`、
+`enabled` 改成 `true` 即可。**真实账号文件不会进镜像**（`.dockerignore` 已排除
+`accounts/`），镜像层里不含任何 token。
+
+Linux 上容器以 root 写出的新文件会被自动 `chown` 回宿主用户（启动时探测
+`/data` 里非 root 属主的文件，每轮跑完归还），不用 `sudo chown`。
+
+### 常用命令
+
+```bash
+docker compose run --rm check          # 立刻体检账号（不打网络）
+docker compose run --rm refresh        # 只续期凭据，token 写回 JSON
+docker compose run --rm refresh-face   # 同上，附带重做人脸核验
+docker compose run --rm run-once       # 立刻跑一轮（真实耗时约 7 分钟）
+docker compose run --rm dry-run        # 按真实时序演练
+docker compose run --rm selftest       # 自检
+```
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `SCHEDULE_TIMES` | `07:30,13:30` | 每天触发时刻，按 `TZ` 计算 |
+| `TZ` | `Asia/Shanghai` | 时区，**与宿主机无关** |
+| `RUN_ARGS` | 空 | 追加给 `runner.py` 的参数，如 `--serial` |
+| `RUN_ON_START` | `0` | 设 `1` 则启动时先立刻跑一轮再转入定时 |
+
+首次部署建议把 `RUN_ON_START` 设成 `1` 验证一轮，确认无误后改回 `0`。
+一轮约 7 分钟，**不会并发叠两轮** —— 上一轮没跑完就一直等它结束。
+
+### 镜像里发生了什么
+
+`Dockerfile` 里 `RUN python selftest.py` 是构建期自检（不打网络，秒级），
+自检不过直接构建失败；`HEALTHCHECK` 盯 `/data/state/heartbeat`，
+调度器每 15 秒续一次，停摆超过 5 分钟即判 unhealthy。
+容器日志同时落在 `docker logs` 和 `/data/logs/run-YYYY-MM-DD.log`。
+
+**镜像不装任何系统包**：不 `apt-get update`、不装 `tzdata`，构建不依赖 apt 源。
+但 Debian slim 没有 `/usr/share/zoneinfo`，glibc 的 `time.localtime()` 会静默
+回落 UTC —— 而本项目用本地时区判当天有效时段（`lptiyu.py` 的 `check_window`）、
+生成 OSS 对象 key，回落 UTC 会让时段判定全错，且报错完全看不出原因。
+因此改用纯 Python 的 `tzdata` 包供数：构建时把它的 TZif 目录链成
+`/usr/share/zoneinfo`，C 库和 Python 读同一份数据。
+
+时区仍会在两处体检：构建期打印一次本地偏移，`docker compose logs` 启动时
+再打一行 `[entrypoint] 时区 TZ=… · 实际 UTC+8 · 本地 …`，不符会告警。
 
 ## 配置
 

@@ -1,0 +1,10 @@
+{
+  "name": "example",
+  "enabled": false,
+  "token": "",
+  "refresh_token": "",
+  "uid": "",
+  "student_num": "",
+  "face_verify_id": "",
+  "face_file": ""
+}

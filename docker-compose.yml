@@ -1,0 +1,41 @@
+# 一条命令起：
+#
+#   docker compose up -d          起，之后每天 07:30 / 13:30（UTC+8）自动跑
+#   docker compose logs -f        看实时输出
+#   docker compose run --rm check 立刻体检一次账号
+#
+# 数据持久化靠下面两个挂载：config.json 和 accounts/ 直接指向仓库里的文件，
+# runner.py 续期后的 token 就地写回（原子写），docker compose down 也不丢。
+# 想让数据完全脱离仓库，把 volumes 换成具名卷：
+#   - lptiyu-data:/data
+#   再配 - "…:/data/config.json" 这类子路径挂载。
+
+# 目录名是中文（或含非 ASCII 字符）时，Compose V2 推不出项目名，直接报
+# project name must not be empty。显式指定后项目名与目录名彻底解耦。
+name: lptiyu
+
+services:
+  runner:
+    build: .
+    image: lptiyu-runner:latest
+    container_name: lptiyu-runner
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Asia/Shanghai
+      SCHEDULE_TIMES: "07:30,13:30"
+      # 追加给 runner.py 的参数，留空 = 与 CI 一致（错峰并行）。
+      # 例："--serial" 串行错开跑，或 "--quiet" 只看警告以上
+      RUN_ARGS: ""
+      # 首次部署改成 1，立刻先跑一轮验证；验证完改回 0
+      RUN_ON_START: "0"
+    volumes:
+      - ./config.json:/data/config.json
+      - ./accounts:/data/accounts
+      - lptiyu-logs:/data/logs
+    stop_grace_period: 30s
+
+# 服务里引用了具名卷就必须在这里声明，否则报
+# service "runner" refers to undefined volume lptiyu-logs
+volumes:
+  lptiyu-logs:

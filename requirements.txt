@@ -1,0 +1,6 @@
+pycryptodome>=3.20
+# 时区数据。Debian slim 不含 tzdata，而 runner.py 用 time.localtime()
+# 判「当天有效时段」(lptiyu.py:610)、datetime.now() 生成 OSS 对象 key
+# (lptiyu.py:774) —— 全是进程本地时区，缺了会静默回落 UTC，时段判定全错。
+# 用纯 Python 包供数，避免动系统包（不装 tzdata / 不 apt-get update）。
+tzdata>=2024.1
